@@ -1,35 +1,43 @@
+import csv
+import ctypes
 import os
+import shutil
 import time
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 
-# this only works when you load it on obs wont work on vscode for example
 import obspython as obs
 
-# default values
 vid_total = 1
 vid_count = 1
 camera_id = 1
 week = 0
 day = 0
 
-# adds the input boxes we use to get input that then changes file name
+SEEMA_TIME = 1783354049
+NS_PER_SECOND = 1_000_000_000
+PST_OFFSET_NS = 7 * 3600 * NS_PER_SECOND
+WINDOWS_TICK_NS = 100
+WINDOWS_TICKS_TO_UNIX_EPOCH = 11644473600 * 10_000_000
+
+FRAME_LOG_TEMP_PREFIX = "frame-logger-"
+FRAME_LOG_TEMP_SUFFIX = "-real.tmp.csv"
+OBS_FILENAME_FORMAT_SECTION = "Output"
+OBS_FILENAME_FORMAT_KEY = "FilenameFormatting"
+SCRIPT_VERSION = "2026-07-08-seema-pid-filenames-week-padding"
+
+
 def script_properties():
     p = obs.obs_properties_create()
     obs.obs_properties_add_int(p, "vid_total", "total video recordings", 1, 100, 1)
     obs.obs_properties_add_int(p, "vid_count", "video recording number", 1, 100, 1)
-
-    # choice of six cameras + backup
     obs.obs_properties_add_int(p, "camera_id", "Camera number", 1, 7, 1)
-
-    # Week and Day Selection (for now only 4 weeks, 5 days in a week, go 0 for testing)
-    obs.obs_properties_add_int(p, "week", "Week number", 0, 4, 1)
+    obs.obs_properties_add_int(p, "week", "Week number", 0, 9999, 1)
     obs.obs_properties_add_int(p, "day", "Day number", 1, 5, 1)
-
     return p
 
-# this just shows all the default values in the new input boxes added
+
 def script_defaults(s):
     obs.obs_data_set_default_int(s, "vid_total", 1)
     obs.obs_data_set_default_int(s, "vid_count", 1)
@@ -37,7 +45,7 @@ def script_defaults(s):
     obs.obs_data_set_default_int(s, "week", 0)
     obs.obs_data_set_default_int(s, "day", 1)
 
-# updates the vid_total and vid_count variable
+
 def script_update(s):
     global vid_total, vid_count, camera_id, week, day
     vid_total = obs.obs_data_get_int(s, "vid_total")
@@ -45,42 +53,222 @@ def script_update(s):
     camera_id = obs.obs_data_get_int(s, "camera_id")
     week = obs.obs_data_get_int(s, "week")
     day = obs.obs_data_get_int(s, "day")
+    set_obs_recording_filename_format()
 
-# Seema Number
-MEINBERG_DELTA = 1752160362
 
-# returns the ISO stamp at moment of call
-def iso_stamp():
-    real_time = MEINBERG_DELTA + time.time()
-    pst_time = real_time - (7 * 3600)  # manually subtract 8 hours for PST (Cali Time)
-    local_time = datetime.fromtimestamp(pst_time, tz=timezone.utc)  # explicitly UTC
-    return f"{local_time.strftime('%Y-%m-%dT%H_%M_%S')}_{local_time.microsecond // 1000:03d}-PST"
+def log_obs(level, message):
+    try:
+        obs.script_log(level, f"[recording_formatting] {message}")
+    except Exception:
+        pass
 
-# main function for formatting basically
-def formatting_event(e):
-    if e == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
-        # get the path of the just-finished recording
-        src = obs.obs_frontend_get_last_recording()
-        if not src:
-            return
 
-        # determine the base directory where OBS saved the file
-        base_dir = Path(src).parent
+def obs_process_recording_format():
+    return f"obs-{os.getpid()}-%CCYY-%MM-%DD %hh-%mm-%ss"
 
-        # make the subfolder W#/D#/vid
-        target_dir = base_dir / f"W{week}" / f"D{day}" / "vid"
-        target_dir.mkdir(parents=True, exist_ok=True)
 
-        # build the new filename
-        filename = f"C{camera_id}_W{week}D{day}_REC{vid_count}-{vid_total}_{iso_stamp()}.mp4"
+def set_obs_recording_filename_format():
+    try:
+        config = obs.obs_frontend_get_profile_config()
+    except Exception as e:
+        log_obs(obs.LOG_WARNING, f"Could not access OBS profile config: {e}")
+        return
 
-        # move and rename the recording file
-        dest = target_dir / filename
-        shutil.move(src, str(dest))
+    if not config:
+        log_obs(obs.LOG_WARNING, "OBS profile config unavailable; cannot set process-specific recording filename.")
+        return
 
-# start listening for events
+    desired = obs_process_recording_format()
+    try:
+        current = obs.config_get_string(config, OBS_FILENAME_FORMAT_SECTION, OBS_FILENAME_FORMAT_KEY) or ""
+    except Exception:
+        current = ""
+
+    if current == desired:
+        return
+
+    try:
+        obs.config_set_string(config, OBS_FILENAME_FORMAT_SECTION, OBS_FILENAME_FORMAT_KEY, desired)
+        log_obs(obs.LOG_INFO, f"Set live OBS recording filename format to: {desired}")
+    except Exception as e:
+        log_obs(obs.LOG_WARNING, f"Could not set OBS recording filename format: {e}")
+
+
+def current_ptp_disciplined_system_ns():
+    try:
+        ft = wintypes.FILETIME()
+        ctypes.windll.kernel32.GetSystemTimePreciseAsFileTime(ctypes.byref(ft))
+        ticks = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+        return (ticks - WINDOWS_TICKS_TO_UNIX_EPOCH) * WINDOWS_TICK_NS
+    except Exception:
+        return time.time_ns()
+
+
+def iso_stamp_from_ptp_ns(ptp_ns):
+    pst_ns = ptp_ns + (SEEMA_TIME * NS_PER_SECOND) - PST_OFFSET_NS
+    sec, ns = divmod(pst_ns, NS_PER_SECOND)
+    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    ms = ns // 1_000_000
+    iso = f"{dt.strftime('%Y-%m-%dT%H_%M_%S')}_{ms:03d}-PST"
+    date_str = dt.strftime("%Y_%m_%d")
+    return iso, date_str
+
+
+def fallback_iso_stamp():
+    return iso_stamp_from_ptp_ns(current_ptp_disciplined_system_ns())
+
+
+def date_str_from_iso(iso):
+    try:
+        return iso.split("T", 1)[0].replace("-", "_")
+    except Exception:
+        return fallback_iso_stamp()[1]
+
+
+def week_label():
+    return f"{week:02d}"
+
+
+def frame_log_temp_name_for_this_obs():
+    return f"{FRAME_LOG_TEMP_PREFIX}{os.getpid()}{FRAME_LOG_TEMP_SUFFIX}"
+
+
+def frame_log_candidates(base_dir, original_video_base):
+    return [base_dir / frame_log_temp_name_for_this_obs()]
+
+
+def wait_for_any_stable_file(paths, timeout=30, settle=1.0):
+    start = time.time()
+    last_sizes = {}
+    stable_since = {}
+
+    while time.time() - start < timeout:
+        for path in paths:
+            if not path.exists():
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+
+            if last_sizes.get(path) == size:
+                if stable_since.get(path) is None:
+                    stable_since[path] = time.time()
+                elif time.time() - stable_since[path] >= settle:
+                    return path
+            else:
+                last_sizes[path] = size
+                stable_since[path] = None
+
+        time.sleep(0.25)
+
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def read_frame_log_iso(frame_log):
+    if not frame_log or not frame_log.exists():
+        return None
+
+    try:
+        with frame_log.open(newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                for key in ("ISO_timestamp", "ISO_stamp", "ISO_2025"):
+                    value = (row.get(key) or "").strip()
+                    if value:
+                        return value
+    except Exception as e:
+        log_obs(obs.LOG_WARNING, f"Could not read timestamp from {frame_log}: {e}")
+    return None
+
+
+def move_with_retry(src, dst, timeout=30):
+    start = time.time()
+    last_error = None
+    while time.time() - start < timeout:
+        try:
+            shutil.move(str(src), str(dst))
+            return True
+        except Exception as e:
+            last_error = e
+            time.sleep(0.25)
+
+    try:
+        shutil.copy2(str(src), str(dst))
+        src.unlink()
+        return True
+    except Exception as e:
+        log_obs(obs.LOG_WARNING, f"Could not move {src} to {dst}: {e}; last move error: {last_error}")
+        return False
+
+
+def collision_safe_path(path):
+    if not path.exists():
+        return path
+
+    pid_path = path.with_name(f"{path.stem}_OBS{os.getpid()}{path.suffix}")
+    if not pid_path.exists():
+        return pid_path
+
+    for i in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_OBS{os.getpid()}_{i}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError(f"Could not find non-colliding destination for {path}")
+
+
+def on_recording_stop(event):
+    if event != obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
+        return
+
+    recording = obs.obs_frontend_get_last_recording()
+    if not recording:
+        return
+
+    mp4 = Path(recording)
+    base_dir = mp4.parent
+    original_video_base = mp4.stem
+
+    candidates = frame_log_candidates(base_dir, original_video_base)
+    log_obs(obs.LOG_INFO, f"Looking for this OBS process frame log: {candidates[0]}")
+    frame_log = wait_for_any_stable_file(candidates)
+    if frame_log:
+        log_obs(obs.LOG_INFO, f"Using frame log: {frame_log}")
+
+    iso = read_frame_log_iso(frame_log)
+    if iso:
+        date_str = date_str_from_iso(iso)
+    else:
+        iso, date_str = fallback_iso_stamp()
+        log_obs(obs.LOG_WARNING, "Frame log timestamp unavailable; using current PTP-disciplined time for filename.")
+
+    week_id = week_label()
+
+    target = base_dir / f"W{week_id}" / f"D{day}" / f"Video_W{week_id}D{day}_{date_str}"
+    target.mkdir(parents=True, exist_ok=True)
+    logs = target / "video_log"
+    logs.mkdir(parents=True, exist_ok=True)
+
+    new_mp4 = collision_safe_path(target / f"C{camera_id}_W{week_id}D{day}_REC{vid_count}-{vid_total}_{iso}.mp4")
+    move_with_retry(mp4, new_mp4)
+
+    if frame_log and frame_log.exists():
+        new_csv = collision_safe_path(logs / f"L{camera_id}_W{week_id}D{day}_REC{vid_count}-{vid_total}_{iso}.csv")
+        move_with_retry(frame_log, new_csv)
+    else:
+        log_obs(obs.LOG_WARNING, "No frame log CSV found to move with the recording.")
+
+
 def script_load(s):
-    obs.obs_frontend_add_event_callback(formatting_event)
+    log_obs(obs.LOG_INFO, f"Loaded version {SCRIPT_VERSION} from {__file__}; pid={os.getpid()}")
+    set_obs_recording_filename_format()
+    obs.obs_frontend_add_event_callback(on_recording_stop)
+
 
 def script_unload():
     pass
