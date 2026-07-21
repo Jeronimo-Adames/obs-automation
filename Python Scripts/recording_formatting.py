@@ -16,16 +16,17 @@ camera_id = 1
 week = 0
 day = 0
 
-SEEMA_TIME = 1783354049
 NS_PER_SECOND = 1_000_000_000
 WINDOWS_TICK_NS = 100
 WINDOWS_TICKS_TO_UNIX_EPOCH = 11644473600 * 10_000_000
 
-FRAME_LOG_TEMP_PREFIX = "frame-logger-"
-FRAME_LOG_TEMP_SUFFIX = "-real.tmp.csv"
+FRAME_LOG_TEMP_PREFIX = "frame-log-"
+FRAME_LOG_TEMP_SUFFIX = ".tmp.csv"
+LEGACY_FRAME_LOG_TEMP_PREFIX = "frame-logger-"
+LEGACY_FRAME_LOG_TEMP_SUFFIX = "-real.tmp.csv"
 OBS_FILENAME_FORMAT_SECTION = "Output"
 OBS_FILENAME_FORMAT_KEY = "FilenameFormatting"
-SCRIPT_VERSION = "2026-07-10-seema-local-dst-ms-week-day-padding"
+SCRIPT_VERSION = "2026-07-21-system-time"
 
 ISO_STAMP_RE = re.compile(
     r"(?<!\d)"
@@ -104,7 +105,7 @@ def set_obs_recording_filename_format():
         log_obs(obs.LOG_WARNING, f"Could not set OBS recording filename format: {e}")
 
 
-def current_ptp_disciplined_system_ns():
+def current_system_ns():
     try:
         ft = wintypes.FILETIME()
         ctypes.windll.kernel32.GetSystemTimePreciseAsFileTime(ctypes.byref(ft))
@@ -114,10 +115,9 @@ def current_ptp_disciplined_system_ns():
         return time.time_ns()
 
 
-def iso_stamp_from_ptp_ns(ptp_ns):
-    real_ns = ptp_ns + (SEEMA_TIME * NS_PER_SECOND)
-    rounded_real_ns = ((real_ns + 500_000) // 1_000_000) * 1_000_000
-    sec, ns = divmod(rounded_real_ns, NS_PER_SECOND)
+def iso_stamp_from_system_ns(system_ns):
+    rounded_ns = ((system_ns + 500_000) // 1_000_000) * 1_000_000
+    sec, ns = divmod(rounded_ns, NS_PER_SECOND)
     local = time.localtime(sec)
     ms = ns // 1_000_000
     suffix = "-PDT" if local.tm_isdst > 0 else "-PST"
@@ -127,7 +127,7 @@ def iso_stamp_from_ptp_ns(ptp_ns):
 
 
 def fallback_iso_stamp():
-    return iso_stamp_from_ptp_ns(current_ptp_disciplined_system_ns())
+    return iso_stamp_from_system_ns(current_system_ns())
 
 
 def round_to_millisecond(dt):
@@ -181,7 +181,10 @@ def frame_log_temp_name_for_this_obs():
 
 
 def frame_log_candidates(base_dir, original_video_base):
-    return [base_dir / frame_log_temp_name_for_this_obs()]
+    return [
+        base_dir / frame_log_temp_name_for_this_obs(),
+        base_dir / f"{LEGACY_FRAME_LOG_TEMP_PREFIX}{os.getpid()}{LEGACY_FRAME_LOG_TEMP_SUFFIX}",
+    ]
 
 
 def wait_for_any_stable_file(paths, timeout=30, settle=1.0):
@@ -292,7 +295,7 @@ def on_recording_stop(event):
         date_str = date_str_from_iso(iso)
     else:
         iso, date_str = fallback_iso_stamp()
-        log_obs(obs.LOG_WARNING, "Frame log timestamp unavailable; using current PTP-disciplined time for filename.")
+        log_obs(obs.LOG_WARNING, "Frame log timestamp unavailable; using current system time for filename.")
 
     week_id = week_label()
     day_id = day_label()

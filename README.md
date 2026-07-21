@@ -1,10 +1,10 @@
 # OBS Automation Scripts
 
-This repo contains the OBS Python script half of the classroom recording workflow. It works with the native Frame Logger OBS plugin from `frame-logger-for-obs`.
+This repo contains the OBS Python script half of the classroom recording workflow. It works with the native Frame Log OBS plugin from `frame-logger-for-obs`.
 
 Both pieces are required:
 
-- `frame-logger-for-obs.dll` creates the precise per-frame CSV.
+- `frame-log.dll` creates the precise per-frame CSV.
 - `Python Scripts/recording_formatting.py` renames and moves the MP4 and matching CSV after recording stops.
 
 Do not also load old Python frame-logging scripts. The C++ plugin is the frame logger now; this Python OBS script is the organizer/formatter.
@@ -45,7 +45,7 @@ D03
 The native plugin writes a temporary CSV next to the active OBS recording:
 
 ```text
-frame-logger-<OBS_PROCESS_ID>-real.tmp.csv
+frame-log-<OBS_PROCESS_ID>.tmp.csv
 ```
 
 The Python script looks only for the temp CSV belonging to its own OBS process. This lets six simultaneous OBS instances record into the same output folder without fighting over the same temp log.
@@ -57,16 +57,10 @@ The script reads the first `ISO_timestamp` from that CSV, normalizes it to exact
 The C++ plugin is the source of truth for frame timestamps. It calculates:
 
 ```text
-PTP-disciplined Windows time + SEEMA_TIME
+GPS/PTP-disciplined Windows system time
 ```
 
-Current SEEMA time:
-
-```text
-1783354049
-```
-
-The Python script has a fallback timestamp path for cases where the C++ log is missing. That fallback also adds `SEEMA_TIME` first, then uses local Windows timezone rules on the real SEEMA-adjusted date. It does not decide `PDT` or `PST` from the fake 1970-ish system date.
+The GPS/PTP software must keep Windows system time correct. The C++ plugin and Python fallback both use that precise system clock directly; neither adds SEEMA time. Windows local timezone rules select `PDT` or `PST` from the real system date, and this works without internet access.
 
 In summer California time, expected suffix is:
 
@@ -106,7 +100,7 @@ The CSV still contains:
 frame,timestamp_ms,ISO_timestamp
 ```
 
-`timestamp_ms` is relative frame time from recording start. `ISO_timestamp` is absolute SEEMA-adjusted time, rounded to exactly three millisecond digits.
+`timestamp_ms` is relative frame time from recording start. `ISO_timestamp` is absolute system time, rounded to exactly three millisecond digits.
 
 If a final MP4 or CSV path already exists, the script appends the OBS process ID and then a numeric suffix if needed:
 
@@ -145,7 +139,7 @@ The script logs its version and path on load.
 The companion plugin belongs in ProgramData as a third-party OBS plugin package:
 
 ```text
-C:\ProgramData\obs-studio\plugins\frame-logger-for-obs\bin\64bit\frame-logger-for-obs.dll
+C:\ProgramData\obs-studio\plugins\frame-log\bin\64bit\frame-log.dll
 ```
 
 `C:\ProgramData` is often hidden. Type this directly into File Explorer:
