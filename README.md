@@ -1,125 +1,147 @@
-# OBS Automation Scripts
+# OBS Recording Tools
 
-This repo contains the OBS Python script half of the classroom recording workflow. It works with the native Frame Log OBS plugin from `frame-logger-for-obs`.
+This repository contains the two runtime components used together on every recording computer:
 
-Both pieces are required:
+1. `runtime/frame-log/bin/frame-log.dll` logs one timestamped CSV row per rendered OBS frame.
+2. `runtime/recording_formatting.py` gives the finished MP4 and CSV their camera, week, day, recording, and start-time names and moves them into the final folders.
 
-- `frame-log.dll` creates the precise per-frame CSV.
-- `Python Scripts/recording_formatting.py` renames and moves the MP4 and matching CSV after recording stops.
+The C++ plugin owns frame capture and timestamps. The Python script owns final naming and file organization. Do not load a separate Python frame logger; it would duplicate the plugin's work and create competing CSV files.
 
-Do not also load old Python frame-logging scripts. The C++ plugin is the frame logger now; this Python OBS script is the organizer/formatter.
-
-## Active OBS Runtime Script
-
-Load this file in OBS:
+## Repository Layout
 
 ```text
-Python Scripts\recording_formatting.py
+runtime/
+  recording_formatting.py       OBS Python formatter/organizer
+  frame-log/
+    src/frame-log.cpp           Native OBS frame logger source
+    bin/frame-log.dll           Ready-to-install Windows x64 plugin
+    CMakeLists.txt               Plugin build entry point
+    CMakePresets.json            Windows/macOS/Linux build presets
+    buildspec.json               Plugin name, version, and OBS dependencies
+    cmake/                       OBS plugin build support
+    build-aux/                   Formatting/build helpers
+tools/
+  log-repair/                    Offline tools for already-recorded CSV files
 ```
 
-In OBS:
+Only the two files under `runtime` are needed for normal OBS recording. The tools under `tools/log-repair` are for historical data repair and are never loaded into OBS.
+
+## Install On Windows
+
+### 1. Install The Native Plugin
+
+Completely close every OBS instance and confirm no `obs64.exe` remains in Task Manager.
+
+Create this folder if needed:
 
 ```text
-Tools > Scripts > + > recording_formatting.py
+C:\ProgramData\obs-studio\plugins\frame-log\bin\64bit
 ```
 
-The script exposes fields for:
+Copy:
 
 ```text
-total video recordings
-video recording number
-Camera number
-Week number
-Day number
+runtime\frame-log\bin\frame-log.dll
 ```
 
-Week and day values are output with two digits:
+to:
 
 ```text
-W09
-D03
+C:\ProgramData\obs-studio\plugins\frame-log\bin\64bit\frame-log.dll
 ```
 
-## How It Works With Frame Logger
+`C:\ProgramData` is hidden by default on many Windows and managed UCSD computers. Type the path directly into File Explorer or enable **View > Show > Hidden items**.
 
-The native plugin writes a temporary CSV next to the active OBS recording:
+Remove old copies of `frame-logger-for-obs.dll` or `frame-log.dll` from other OBS plugin locations. OBS can scan several locations, including:
 
 ```text
-frame-log-<OBS_PROCESS_ID>.tmp.csv
+C:\Program Files\obs-studio\obs-plugins\64bit
+C:\ProgramData\obs-studio\plugins
+C:\Users\<user>\AppData\Roaming\obs-studio\plugins
+C:\Users\<user>\AppData\Local\obs-studio\plugins
 ```
 
-The Python script looks only for the temp CSV belonging to its own OBS process. This lets six simultaneous OBS instances record into the same output folder without fighting over the same temp log.
+There should be one active copy of the plugin per computer.
 
-The script reads the first `ISO_timestamp` from that CSV, normalizes it to exactly three millisecond digits, then uses that timestamp for the final MP4 and CSV names.
+### 2. Load The Python Formatter
 
-## Time And DST Behavior
-
-The C++ plugin is the source of truth for frame timestamps. It calculates:
+Open OBS and go to:
 
 ```text
-GPS/PTP-disciplined Windows system time
+Tools > Scripts > +
 ```
 
-The GPS/PTP software must keep Windows system time correct. The C++ plugin and Python fallback both use that precise system clock directly; neither adds SEEMA time. Windows local timezone rules select `PDT` or `PST` from the real system date, and this works without internet access.
-
-In summer California time, expected suffix is:
+Select:
 
 ```text
--PDT
+runtime\recording_formatting.py
 ```
 
-In winter:
+If OBS still lists `Python Scripts\recording_formatting.py`, remove that old entry and add the new `runtime` path. OBS remembers the exact script path.
+
+Configure the script's recording count, recording number, camera number, week, and day. Week and day labels are always padded to two digits, such as `W09D03`.
+
+## How The Two Components Work Together
+
+When recording starts:
+
+1. OBS begins an MP4 whose temporary filename contains that OBS process ID.
+2. `frame-log.dll` creates `frame-log-<PID>.tmp.csv` beside the MP4.
+3. The plugin captures precise Windows system time once with `GetSystemTimePreciseAsFileTime()`.
+4. Each frame advances that absolute-time anchor using OBS's monotonic `os_gettime_ns()` clock.
+5. CSV writing happens on a background writer thread so disk work does not block frame capture.
+
+When recording stops:
+
+1. `recording_formatting.py` waits for the CSV belonging to its own OBS process to finish writing.
+2. It reads the first `ISO_timestamp` from that CSV as the recording start time.
+3. It rounds any fractional timestamp to exactly three millisecond digits.
+4. It creates the final week/day/video/log folders.
+5. It moves and renames the MP4 and CSV together.
+
+The OBS process ID keeps six simultaneous OBS instances from sharing temporary files. Final-name collisions add `_OBS<PID>` and then a numeric suffix instead of overwriting existing recordings.
+
+## Time Model
+
+The GPS/PTP software must discipline the Windows system clock to the correct current date and time. Both runtime components use Windows system time directly:
 
 ```text
--PST
+absolute timestamp = GPS/PTP-disciplined Windows system time
 ```
 
-## Final Output Layout
+No SEEMA value or fixed epoch offset is added. Historical SEEMA constants exist only inside offline repair tools for old recordings.
 
-The script sets OBS's live recording filename format to include the current OBS process ID:
+The plugin records the absolute anchor once and uses monotonic elapsed time for every frame. This prevents a mid-recording system-clock step from making frame timestamps jump backward while retaining the precision of the GPS/PTP-disciplined start time.
 
-```text
-obs-<pid>-YYYY-MM-DD HH-MM-SS.mp4
+Windows converts the real system date into local California time. Its installed timezone rules choose `PDT` during daylight saving time and `PST` otherwise. Internet access is not required, but Windows must be configured for the correct Pacific timezone and automatic daylight-saving adjustment.
+
+## CSV And Output Names
+
+The plugin writes:
+
+```csv
+frame,timestamp_ms,ISO_timestamp
+1,2.486,2026-07-10T09_12_34_568-PDT
+2,19.153,2026-07-10T09_12_34_584-PDT
 ```
 
-That raw MP4 name is only temporary. After recording stops, the script moves the MP4 and matching CSV into:
+`timestamp_ms` is elapsed time from recording start. `ISO_timestamp` is local absolute system time rounded to exactly three millisecond digits.
+
+Expected final layout:
 
 ```text
 <OBS output folder>/
   W09/
     D03/
-      VIDEO_W09D03_YYYY_MM_DD/
-        C4_W09D03_REC7-13_YYYY-MM-DDTHH_MM_SS_mmm-PDT.mp4
-        VIDEO_LOG_W09D03_YYYY_MM_DD/
-          L4_W09D03_REC7-13_YYYY-MM-DDTHH_MM_SS_mmm-PDT.csv
+      VIDEO_W09D03_2026_07_10/
+        C4_W09D03_REC7-13_2026-07-10T09_12_34_568-PDT.mp4
+        VIDEO_LOG_W09D03_2026_07_10/
+          L4_W09D03_REC7-13_2026-07-10T09_12_34_568-PDT.csv
 ```
 
-The CSV still contains:
+## Verify The Installation
 
-```csv
-frame,timestamp_ms,ISO_timestamp
-```
-
-`timestamp_ms` is relative frame time from recording start. `ISO_timestamp` is absolute system time, rounded to exactly three millisecond digits.
-
-If a final MP4 or CSV path already exists, the script appends the OBS process ID and then a numeric suffix if needed:
-
-```text
-_OBS15816
-_OBS15816_2
-```
-
-## Finding The Script OBS Is Actually Using
-
-OBS aggressively remembers script paths. If OBS keeps loading an old script:
-
-```text
-Tools > Scripts
-```
-
-Select the script and check the exact file path shown there. Remove old copies, add the intended file again, and restart OBS.
-
-Also check:
+In OBS, open:
 
 ```text
 Help > Log Files > View Current Log
@@ -128,123 +150,52 @@ Help > Log Files > View Current Log
 Search for:
 
 ```text
-[recording_formatting]
-Loaded version
+[FrameLog] Loaded.
+[recording_formatting] Loaded version
 ```
 
-The script logs its version and path on load.
+During a recording, the output folder should contain one `frame-log-<PID>.tmp.csv` per recording OBS process. Duplicate timestamp-named temporary CSV files indicate that an old plugin or Python frame logger is still loaded.
 
-## Plugin Install Location
+## Build The Plugin
 
-The companion plugin belongs in ProgramData as a third-party OBS plugin package:
+Requirements:
 
-```text
-C:\ProgramData\obs-studio\plugins\frame-log\bin\64bit\frame-log.dll
-```
+- Windows x64
+- Visual Studio 2022 Build Tools with the C++ workload
+- CMake 3.28 or newer
+- Windows SDK 10.0.22621 or compatible
 
-`C:\ProgramData` is often hidden. Type this directly into File Explorer:
-
-```text
-C:\ProgramData\obs-studio\plugins
-```
-
-If `ProgramData` is not visible on a managed computer, it may simply be hidden or restricted by policy. The path can still exist and still be the correct install location.
-
-## Repair Tools
-
-The folder includes one-off repair CLIs for already-recorded logs. These are not OBS runtime scripts.
-
-### `fix_logs_from_filename_anchor_batch.py`
-
-Use when the log filename contains the correct recording start timestamp and the CSV contents need to be rebuilt from `timestamp_ms`.
-
-Drop the script into the folder with bad logs and run:
+From the repository root:
 
 ```powershell
-python .\fix_logs_from_filename_anchor_batch.py
+cd .\runtime\frame-log
+cmake --preset windows-x64
+cmake --build --preset windows-x64
 ```
 
-It moves originals into `wrong_logs`, writes corrected logs back into the same folder, and writes `filename_anchor_fix_manifest.csv`.
-
-### `round_log_timestamps_to_milliseconds.py`
-
-Use when existing logs contain six fractional timestamp digits, for example:
+The development DLL is produced at:
 
 ```text
-2026-07-10T09_12_34_567532-PDT
+runtime\frame-log\build_x64\RelWithDebInfo\frame-log.dll
 ```
 
-Run:
-
-```powershell
-python .\round_log_timestamps_to_milliseconds.py
-```
-
-It rounds to exactly three millisecond digits:
+The checked-in install-ready build is:
 
 ```text
-_567532 -> _568
-_567499 -> _567
-_999500 -> next second _000
+runtime\frame-log\bin\frame-log.dll
 ```
 
-It also moves originals into `wrong_logs` and writes a manifest beside the script.
+## Offline Log Repair Tools
 
-### `shift_logs_back_one_hour.py` and `shift_logs_forward_one_hour.py`
+Run these only on copies or folders of historical logs. They are independent CLI programs and are not part of the live OBS workflow.
 
-Use when the entire log filename and all CSV timestamps need a simple one-hour correction.
+- `fix_logs_from_filename_anchor_batch.py`: anchors every CSV to the correct start time in its filename.
+- `round_log_timestamps_to_milliseconds.py`: rounds six-digit fractions to exactly three millisecond digits.
+- `shift_logs_back_one_hour.py`: moves filenames and CSV timestamps back one hour.
+- `shift_logs_forward_one_hour.py`: moves filenames and CSV timestamps forward one hour.
+- `fix_2025_logs_to_2026_batch.py`: repairs the known old-SEEMA/new-SEEMA batch error.
+- `subtract_old_seema_from_logs.py`: removes an old SEEMA offset that was added to an already-correct clock.
+- `correct_seema_logs.py`: applies an explicit known fake-time to real-time anchor.
+- `recalibrate_logs_from_filename.py`: recalibrates a selected log from its filename start time.
 
-```powershell
-python .\shift_logs_back_one_hour.py
-python .\shift_logs_forward_one_hour.py
-```
-
-Both scripts archive originals into `wrong_logs`, write corrected logs back into the same folder, and generate a manifest.
-
-### `fix_2025_logs_to_2026_batch.py`
-
-Use for the old-SEEMA-to-new-SEEMA batch correction. It hardcodes:
-
-```text
-old SEEMA = 1752160362
-new SEEMA = 1783354049
-```
-
-It writes corrected copies into a `fixed_seema_logs` folder.
-
-### `subtract_old_seema_from_logs.py`
-
-Use when logs were recorded on computers already set to real-world time but the old SEEMA offset was added again. It subtracts:
-
-```text
-1752160362
-```
-
-from absolute timestamp columns and leaves relative frame timing untouched.
-
-### `correct_seema_logs.py`
-
-Use for explicit anchor-based repairs when a known fake timestamp maps to a known real timestamp.
-
-## USB Package Layout
-
-The current USB package is organized under:
-
-```text
-D:\OBS_Tools
-```
-
-Useful folders:
-
-```text
-D:\OBS_Tools\01_frame_logger_plugin_programdata_install
-D:\OBS_Tools\02_recording_formatter_obs_python
-D:\OBS_Tools\03_log_repair_tools
-D:\OBS_Tools\04_source_reference_current_code
-```
-
-The active OBS Python script on the USB is:
-
-```text
-D:\OBS_Tools\02_recording_formatter_obs_python\recording_formatting.py
-```
+Each repair script documents its own output folders and manifest behavior in its command help or source header.
