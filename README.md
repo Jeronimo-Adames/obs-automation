@@ -16,10 +16,9 @@ runtime/
     src/frame-log.cpp           Native OBS frame logger source
     bin/frame-log.dll           Ready-to-install Windows x64 plugin
     CMakeLists.txt               Plugin build entry point
-    CMakePresets.json            Windows/macOS/Linux build presets
+    CMakePresets.json            Windows x64 build preset
     buildspec.json               Plugin name, version, and OBS dependencies
     cmake/                       OBS plugin build support
-    build-aux/                   Formatting/build helpers
 tools/
   log-repair/                    Offline tools for already-recorded CSV files
 ```
