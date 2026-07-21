@@ -24,7 +24,7 @@ TIMESTAMP_RE = re.compile(
     r"T"
     r"(?P<hour>\d{1,2})[_:](?P<minute>\d{2})[_:](?P<second>\d{2})"
     r"(?P<frac_sep>[_.])(?P<fraction>\d{1,6})"
-    r"(?P<suffix>Z|-PST|PST|-07_00|-08_00|[+-]\d{2}:?\d{2})?"
+    r"(?P<suffix>Z|-PST|-PDT|PST|PDT|-07_00|-08_00|[+-]\d{2}:?\d{2})?"
 )
 
 ISO_COLUMNS = {"iso_timestamp", "iso_stamp", "iso_2025"}
@@ -101,14 +101,11 @@ def parse_filename_anchor(path: Path) -> tuple[datetime, str, int]:
 
 
 def format_iso_like(anchor: datetime, suffix: str, fraction_digits: int = 3) -> str:
-    if fraction_digits <= 3:
-        frac = int((Decimal(anchor.microsecond) / Decimal(1000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-        if frac >= 1000:
-            anchor += timedelta(seconds=1)
-            frac = 0
-        return anchor.strftime("%Y-%m-%dT%H_%M_%S_") + f"{frac:03d}"[:fraction_digits] + suffix
-
-    return anchor.strftime("%Y-%m-%dT%H_%M_%S_") + f"{anchor.microsecond:06d}"[:fraction_digits] + suffix
+    frac = int((Decimal(anchor.microsecond) / Decimal(1000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if frac >= 1000:
+        anchor += timedelta(seconds=1)
+        frac = 0
+    return anchor.strftime("%Y-%m-%dT%H_%M_%S_") + f"{frac:03d}" + suffix
 
 
 def decimal_seconds(delta: timedelta) -> Decimal:

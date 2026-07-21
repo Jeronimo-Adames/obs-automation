@@ -30,7 +30,7 @@ DATETIME_RE = re.compile(
     r"T"
     r"(?P<hour>\d{1,2})(?P<time_sep>[_:])(?P<minute>\d{2})(?P=time_sep)(?P<second>\d{2})"
     r"(?:(?P<frac_sep>[_.])(?P<fraction>\d{1,6}))?"
-    r"(?P<tz>Z|-PST|PST|-07_00|-08_00|[+-]\d{2}:?\d{2})?"
+    r"(?P<tz>Z|-PST|-PDT|PST|PDT|-07_00|-08_00|[+-]\d{2}:?\d{2})?"
     r"(?!\d)"
 )
 
@@ -159,7 +159,16 @@ def datetime_from_match(match: re.Match[str]) -> datetime:
     )
 
 
+def round_to_millisecond(dt: datetime) -> datetime:
+    milliseconds = (dt.microsecond + 500) // 1000
+    if milliseconds >= 1000:
+        dt += timedelta(seconds=1)
+        milliseconds = 0
+    return dt.replace(microsecond=milliseconds * 1000)
+
+
 def format_datetime_like(match: re.Match[str], shifted: datetime) -> str:
+    shifted = round_to_millisecond(shifted)
     date_sep = match.group("date_sep")
     time_sep = match.group("time_sep")
     result = (
@@ -170,11 +179,7 @@ def format_datetime_like(match: re.Match[str], shifted: datetime) -> str:
     fraction = match.group("fraction")
     if fraction is not None:
         frac_sep = match.group("frac_sep") or "_"
-        if len(fraction) <= 3:
-            frac_value = shifted.microsecond // 1000
-            result += f"{frac_sep}{frac_value:03d}"[: len(frac_sep) + len(fraction)]
-        else:
-            result += f"{frac_sep}{shifted.microsecond:06d}"[: len(frac_sep) + len(fraction)]
+        result += f"{frac_sep}{shifted.microsecond // 1000:03d}"
 
     return result + (match.group("tz") or "")
 
@@ -191,11 +196,10 @@ def compact_datetime_from_match(match: re.Match[str]) -> tuple[datetime, int]:
 
 
 def format_compact_like(shifted: datetime, fraction_len: int) -> str:
+    shifted = round_to_millisecond(shifted)
     result = shifted.strftime("%Y%m%d%H%M%S")
-    if fraction_len == 3:
+    if fraction_len in (3, 6):
         result += f"{shifted.microsecond // 1000:03d}"
-    elif fraction_len == 6:
-        result += f"{shifted.microsecond:06d}"
     return result
 
 
@@ -213,6 +217,7 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def format_rebased_iso(dt: datetime, suffix: str) -> str:
+    dt = round_to_millisecond(dt)
     return dt.strftime("%Y-%m-%dT%H_%M_%S_") + f"{dt.microsecond // 1000:03d}{suffix}"
 
 

@@ -4,8 +4,9 @@ import os
 import shutil
 import time
 from ctypes import wintypes
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+import re
 
 import obspython as obs
 
@@ -17,7 +18,6 @@ day = 0
 
 SEEMA_TIME = 1783354049
 NS_PER_SECOND = 1_000_000_000
-PST_OFFSET_NS = 7 * 3600 * NS_PER_SECOND
 WINDOWS_TICK_NS = 100
 WINDOWS_TICKS_TO_UNIX_EPOCH = 11644473600 * 10_000_000
 
@@ -25,7 +25,17 @@ FRAME_LOG_TEMP_PREFIX = "frame-logger-"
 FRAME_LOG_TEMP_SUFFIX = "-real.tmp.csv"
 OBS_FILENAME_FORMAT_SECTION = "Output"
 OBS_FILENAME_FORMAT_KEY = "FilenameFormatting"
-SCRIPT_VERSION = "2026-07-08-seema-pid-filenames-week-padding"
+SCRIPT_VERSION = "2026-07-10-seema-local-dst-ms-week-day-padding"
+
+ISO_STAMP_RE = re.compile(
+    r"(?<!\d)"
+    r"(?P<year>\d{4})[-_](?P<month>\d{1,2})[-_](?P<day>\d{1,2})"
+    r"T"
+    r"(?P<hour>\d{1,2})[_:](?P<minute>\d{2})[_:](?P<second>\d{2})"
+    r"(?:(?P<frac_sep>[_.])(?P<fraction>\d{1,6}))?"
+    r"(?P<suffix>Z|-PST|-PDT|PST|PDT|-07_00|-08_00|[+-]\d{2}:?\d{2})?"
+    r"(?!\d)"
+)
 
 
 def script_properties():
@@ -105,12 +115,14 @@ def current_ptp_disciplined_system_ns():
 
 
 def iso_stamp_from_ptp_ns(ptp_ns):
-    pst_ns = ptp_ns + (SEEMA_TIME * NS_PER_SECOND) - PST_OFFSET_NS
-    sec, ns = divmod(pst_ns, NS_PER_SECOND)
-    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    real_ns = ptp_ns + (SEEMA_TIME * NS_PER_SECOND)
+    rounded_real_ns = ((real_ns + 500_000) // 1_000_000) * 1_000_000
+    sec, ns = divmod(rounded_real_ns, NS_PER_SECOND)
+    local = time.localtime(sec)
     ms = ns // 1_000_000
-    iso = f"{dt.strftime('%Y-%m-%dT%H_%M_%S')}_{ms:03d}-PST"
-    date_str = dt.strftime("%Y_%m_%d")
+    suffix = "-PDT" if local.tm_isdst > 0 else "-PST"
+    iso = f"{time.strftime('%Y-%m-%dT%H_%M_%S', local)}_{ms:03d}{suffix}"
+    date_str = time.strftime("%Y_%m_%d", local)
     return iso, date_str
 
 
@@ -118,15 +130,50 @@ def fallback_iso_stamp():
     return iso_stamp_from_ptp_ns(current_ptp_disciplined_system_ns())
 
 
+def round_to_millisecond(dt):
+    ms = (dt.microsecond + 500) // 1000
+    if ms >= 1000:
+        dt += timedelta(seconds=1)
+        ms = 0
+    return dt.replace(microsecond=ms * 1000)
+
+
+def normalize_iso_stamp(iso):
+    value = (iso or "").strip()
+    match = ISO_STAMP_RE.search(value)
+    if not match:
+        return value
+
+    fraction = match.group("fraction") or "0"
+    microsecond = int(fraction.ljust(6, "0")[:6])
+    dt = datetime(
+        int(match.group("year")),
+        int(match.group("month")),
+        int(match.group("day")),
+        int(match.group("hour")),
+        int(match.group("minute")),
+        int(match.group("second")),
+        microsecond,
+    )
+    dt = round_to_millisecond(dt)
+    suffix = match.group("suffix") or ""
+    normalized = f"{dt.strftime('%Y-%m-%dT%H_%M_%S')}_{dt.microsecond // 1000:03d}{suffix}"
+    return value[: match.start()] + normalized + value[match.end() :]
+
+
 def date_str_from_iso(iso):
     try:
-        return iso.split("T", 1)[0].replace("-", "_")
+        return normalize_iso_stamp(iso).split("T", 1)[0].replace("-", "_")
     except Exception:
         return fallback_iso_stamp()[1]
 
 
 def week_label():
     return f"{week:02d}"
+
+
+def day_label():
+    return f"{day:02d}"
 
 
 def frame_log_temp_name_for_this_obs():
@@ -180,7 +227,7 @@ def read_frame_log_iso(frame_log):
                 for key in ("ISO_timestamp", "ISO_stamp", "ISO_2025"):
                     value = (row.get(key) or "").strip()
                     if value:
-                        return value
+                        return normalize_iso_stamp(value)
     except Exception as e:
         log_obs(obs.LOG_WARNING, f"Could not read timestamp from {frame_log}: {e}")
     return None
@@ -248,17 +295,18 @@ def on_recording_stop(event):
         log_obs(obs.LOG_WARNING, "Frame log timestamp unavailable; using current PTP-disciplined time for filename.")
 
     week_id = week_label()
+    day_id = day_label()
 
-    target = base_dir / f"W{week_id}" / f"D{day}" / f"Video_W{week_id}D{day}_{date_str}"
+    target = base_dir / f"W{week_id}" / f"D{day_id}" / f"VIDEO_W{week_id}D{day_id}_{date_str}"
     target.mkdir(parents=True, exist_ok=True)
-    logs = target / "video_log"
+    logs = target / f"VIDEO_LOG_W{week_id}D{day_id}_{date_str}"
     logs.mkdir(parents=True, exist_ok=True)
 
-    new_mp4 = collision_safe_path(target / f"C{camera_id}_W{week_id}D{day}_REC{vid_count}-{vid_total}_{iso}.mp4")
+    new_mp4 = collision_safe_path(target / f"C{camera_id}_W{week_id}D{day_id}_REC{vid_count}-{vid_total}_{iso}.mp4")
     move_with_retry(mp4, new_mp4)
 
     if frame_log and frame_log.exists():
-        new_csv = collision_safe_path(logs / f"L{camera_id}_W{week_id}D{day}_REC{vid_count}-{vid_total}_{iso}.csv")
+        new_csv = collision_safe_path(logs / f"L{camera_id}_W{week_id}D{day_id}_REC{vid_count}-{vid_total}_{iso}.csv")
         move_with_retry(frame_log, new_csv)
     else:
         log_obs(obs.LOG_WARNING, "No frame log CSV found to move with the recording.")
